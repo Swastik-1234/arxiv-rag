@@ -1,0 +1,167 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: arxiv-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Host port 5433 avoids clashing with a locally-installed Postgres on 5432.
+      # Containers still talk to each other over "postgres:5432" inside the network.
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rag-network
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: arxiv-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - rag-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: arxiv-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rag-network
+    restart: unless-stopped
+
+  airflow:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: arxiv-airflow
+    command: bash /entrypoint.sh
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+      # Consumed directly by the DAG's fetch_and_store task (src.services.*)
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      ARXIV_CATEGORIES: ${ARXIV_CATEGORIES}
+      ARXIV_MAX_RESULTS: ${ARXIV_MAX_RESULTS}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+      - ./src:/opt/airflow/src
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+    networks:
+      - rag-network
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: arxiv-app
+    ports:
+      - "8000:8000"
+      - "7861:7861"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      REDIS_URL: redis://redis:6379
+      LANGFUSE_HOST: http://langfuse:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+    networks:
+      - rag-network
+    restart: unless-stopped
+
+  langfuse-db:
+    image: postgres:16-alpine
+    container_name: arxiv-langfuse-db
+    environment:
+      POSTGRES_USER: ${LANGFUSE_DB_USER}
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD}
+      POSTGRES_DB: ${LANGFUSE_DB_NAME}
+    volumes:
+      - langfuse-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LANGFUSE_DB_USER} -d ${LANGFUSE_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - rag-network
+    restart: unless-stopped
+
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: arxiv-langfuse
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://${LANGFUSE_DB_USER}:${LANGFUSE_DB_PASSWORD}@langfuse-db:5432/${LANGFUSE_DB_NAME}
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      TELEMETRY_ENABLED: "false"
+      NEXT_PUBLIC_SIGN_UP_DISABLED: "false"
+    networks:
+      - rag-network
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  qdrant-data:
+  redis-data:
+  airflow-logs:
+  langfuse-db-data:
+
+networks:
+  rag-network:
+    driver: bridge
