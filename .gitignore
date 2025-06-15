@@ -26,3 +26,4 @@ airflow/plugins/
 # misc
 *.db
 *.log
+.DS_Store
